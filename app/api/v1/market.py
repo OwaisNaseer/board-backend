@@ -4,17 +4,53 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 import logging
 import asyncio
+import re
 
 router = APIRouter()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+BINANCE_BASE_URL = "https://api.binance.com/api/v3"
+
 @router.get("/market-data")
 async def get_market_data(
+    symbol: str = Query(None, description="Market symbol (e.g., LTCUSDT, BTC, ETH)"),
     interval: str = Query("1h", regex="^(1h|2h|4h|6h|1d)$"),
     date: str = None
 ):
+    # Validate symbol presence
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    # Normalize symbol to uppercase and add USDT if not present
+    symbol = symbol.upper()
+    if not symbol.endswith('USDT'):
+        symbol += 'USDT'
+        logger.info(f"Automatically appended USDT to symbol. New symbol: {symbol}")
+
+    # Basic format validation (alphanumeric)
+    if not re.match(r'^[A-Z0-9]+$', symbol):
+        raise HTTPException(status_code=400, detail="Invalid symbol format. Use alphanumeric only (e.g., LTCUSDT, BTC)")
+
+    # Verify symbol exists on Binance
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{BINANCE_BASE_URL}/exchangeInfo")
+            response.raise_for_status()
+            symbols_list = [s["symbol"] for s in response.json()["symbols"]]
+            if symbol not in symbols_list:
+                # Try to find similar symbols for better error message
+                similar = [s for s in symbols_list if s.startswith(symbol.replace('USDT', ''))]
+                suggestion = f" Did you mean {similar[0]}?" if similar else ""
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Symbol '{symbol}' does not exist on Binance.{suggestion}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to verify symbol {symbol}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to verify symbol with Binance")
+
     # Use today's date in UTC if date not provided
     if not date:
         selected_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -25,9 +61,8 @@ async def get_market_data(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format")
 
-    logger.info(f"Received request for /market-data with interval={interval}, date={selected_date.isoformat()}")
+    logger.info(f"Received request for /market-data with symbol={symbol}, interval={interval}, date={selected_date.isoformat()}")
 
-    symbols = ["ltcusdt"]  # Binance uses USDT pairs
     market_data = []
 
     # Interval configuration: (binance_interval, duration, expected_candles)
@@ -42,7 +77,7 @@ async def get_market_data(
     binance_interval, interval_duration, expected_candles = interval_config[interval]
 
     async def get_klines(symbol: str, retries: int = 3):
-        url = "https://api.binance.com/api/v3/klines"
+        url = f"{BINANCE_BASE_URL}/klines"
         
         # Calculate start time to get enough historical data for all MAs
         periods_needed = 99  # For ma99
@@ -50,7 +85,7 @@ async def get_market_data(
         end_time = selected_date + timedelta(days=1)
         
         params = {
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "interval": binance_interval,
             "startTime": int(start_time.timestamp() * 1000),
             "endTime": int(end_time.timestamp() * 1000),
@@ -63,7 +98,7 @@ async def get_market_data(
                     response = await client.get(url, params=params, timeout=30.0)
                     response.raise_for_status()
                     logger.info(f"Successfully fetched klines for {symbol}")
-                    return symbol, response.json()
+                    return response.json()
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error for {symbol}: {e.response.status_code} - {e.response.text}")
                 await asyncio.sleep(2 ** attempt)
@@ -71,11 +106,11 @@ async def get_market_data(
                 logger.error(f"Network error for {symbol}: {str(e)}")
                 await asyncio.sleep(1)
         logger.error(f"Failed to fetch klines for {symbol} after {retries} attempts")
-        return symbol, []
+        return []
 
     async def get_fallback_price(symbol: str):
-        url = "https://api.binance.com/api/v3/ticker/price"
-        params = {"symbol": symbol.upper()}
+        url = f"{BINANCE_BASE_URL}/ticker/price"
+        params = {"symbol": symbol}
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, params=params, timeout=10.0)
@@ -84,7 +119,7 @@ async def get_market_data(
                 price = float(data["price"])
                 return {
                     "time": selected_date.strftime('%Y-%m-%d %H:%M:%S'),
-                    "symbol": symbol.upper(),
+                    "symbol": symbol,
                     "open": price,
                     "high": price,
                     "low": price,
@@ -93,7 +128,10 @@ async def get_market_data(
                     "ma7": price,
                     "ma25": price,
                     "ma99": price,
-                    "volume": 0.0
+                    "volume": 0.0,
+                    "ma7-ma25": 0.0,
+                    "ma7-ma99": 0.0,
+                    "ma25-ma99": 0.0
                 }
         except httpx.HTTPError as e:
             logger.error(f"Failed to fetch fallback price for {symbol}: {str(e)}")
@@ -147,7 +185,7 @@ async def get_market_data(
 
                     candle = {
                         "time": current_interval_start.strftime('%Y-%m-%d %H:%M:%S'),
-                        "symbol": symbol.upper(),
+                        "symbol": symbol,
                         "open": round(open_price, 4),
                         "high": round(high_price, 4),
                         "low": round(low_price, 4),
@@ -156,7 +194,10 @@ async def get_market_data(
                         "volume": round(volume, 4),
                         "ma7": ma7,
                         "ma25": ma25,
-                        "ma99": ma99
+                        "ma99": ma99,
+                        "ma7-ma25": round(ma7 - ma25, 4),
+                        "ma7-ma99": round(ma7 - ma99, 4),
+                        "ma25-ma99": round(ma25 - ma99, 4)
                     }
                     interval_candles.append(candle)
                 
@@ -182,7 +223,7 @@ async def get_market_data(
 
                 candle = {
                     "time": open_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    "symbol": symbol.upper(),
+                    "symbol": symbol,
                     "open": round(open_price, 4),
                     "high": round(high_price, 4),
                     "low": round(low_price, 4),
@@ -191,33 +232,32 @@ async def get_market_data(
                     "volume": round(volume, 4),
                     "ma7": ma7,
                     "ma25": ma25,
-                    "ma99": ma99
+                    "ma99": ma99,
+                    "ma7-ma25": round(ma7 - ma25, 4),
+                    "ma7-ma99": round(ma7 - ma99, 4),
+                    "ma25-ma99": round(ma25 - ma99, 4)
                 }
                 interval_candles.append(candle)
 
         return interval_candles[:expected_candles]  # Ensure we don't return more than expected
 
-    async with httpx.AsyncClient() as client:
-        tasks = [get_klines(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for symbol, klines in results:
-            if isinstance(klines, list) and klines:
-                interval_data = calculate_metrics(symbol, klines, selected_date)
-                if interval_data:
-                    market_data.extend(interval_data)
-                else:
-                    fallback_data = await get_fallback_price(symbol)
-                    if fallback_data:
-                        market_data.append(fallback_data)
-            else:
-                fallback_data = await get_fallback_price(symbol)
-                if fallback_data:
-                    market_data.append(fallback_data)
+    klines = await get_klines(symbol)
+    if klines:
+        interval_data = calculate_metrics(symbol, klines, selected_date)
+        if interval_data:
+            market_data.extend(interval_data)
+        else:
+            fallback_data = await get_fallback_price(symbol)
+            if fallback_data:
+                market_data.append(fallback_data)
+    else:
+        fallback_data = await get_fallback_price(symbol)
+        if fallback_data:
+            market_data.append(fallback_data)
 
     if not market_data:
-        raise HTTPException(status_code=500, detail="No valid data retrieved for any symbols.")
+        raise HTTPException(status_code=500, detail="No valid data retrieved for the symbol.")
 
-    market_data = sorted(market_data, key=lambda x: (x["symbol"], x["time"]))
+    market_data = sorted(market_data, key=lambda x: x["time"])
     logger.info(f"Response time: {len(market_data)} intervals processed")
     return market_data
