@@ -19,20 +19,18 @@ async def get_market_data(
     interval: str = Query("1h", alias="interval[value]", regex="^(1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d)$"),
     date: str = Query(None, description="ISO date (e.g., 2025-08-11T19:00:00.000Z)")
 ):
-    # Input validation
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
 
     symbol = symbol.upper()
     if not symbol.endswith('USDT'):
         symbol += 'USDT'
-        logger.info(f"Automatically appended USDT to symbol. New symbol: {symbol}")
+        logger.info(f"Appended USDT: {symbol}")
 
     if not re.match(r'^[A-Z0-9]+$', symbol):
-        raise HTTPException(status_code=400, detail="Invalid symbol format. Use alphanumeric only (e.g., LTCUSDT, BTC)")
+        raise HTTPException(status_code=400, detail="Invalid symbol format.")
 
-    # Verify symbol exists on Binance
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         try:
             response = await client.get(f"{BINANCE_BASE_URL}/exchangeInfo")
             response.raise_for_status()
@@ -48,7 +46,6 @@ async def get_market_data(
             logger.error(f"Failed to verify symbol {symbol}: {e}")
             raise HTTPException(status_code=500, detail="Failed to verify symbol with Binance")
 
-    # Parse date and set range to cover only the selected day
     if not date:
         selected_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     else:
@@ -59,12 +56,8 @@ async def get_market_data(
             raise HTTPException(status_code=400, detail="Invalid date format")
 
     end_date = selected_date + timedelta(days=1)
-
     logger.info(f"Request: symbol={symbol}, interval={interval}, date={selected_date.isoformat()}")
 
-    market_data = []
-
-    # Interval configuration: (binance_interval, duration, expected_candles)
     interval_config = {
         '1m': ('1m', timedelta(minutes=1), 1440),
         '3m': ('3m', timedelta(minutes=3), 480),
@@ -85,9 +78,12 @@ async def get_market_data(
 
     binance_interval, interval_duration, expected_candles = interval_config[interval]
 
+    # Safe max limit to prevent 502
+    max_candles = 500
+    expected_candles = min(expected_candles, max_candles)
+
     async def get_klines(symbol: str, retries: int = 3):
         url = f"{BINANCE_BASE_URL}/klines"
-        # Fetch enough history for MA99
         periods_needed = 99
         start_time = selected_date - (interval_duration * periods_needed)
         params = {
@@ -95,34 +91,30 @@ async def get_market_data(
             "interval": binance_interval,
             "startTime": int(start_time.timestamp() * 1000),
             "endTime": int(end_date.timestamp() * 1000),
-            "limit": expected_candles + periods_needed,  # Enough for MAs + requested candles
+            "limit": expected_candles + periods_needed,
         }
 
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(url, params=params, timeout=30.0)
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(url, params=params)
                     response.raise_for_status()
-                    logger.info(f"Fetched {len(response.json())} klines for {symbol} interval {binance_interval}")
+                    logger.info(f"Fetched {len(response.json())} klines for {symbol}")
                     return response.json()
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error for {symbol}: {e.response.status_code} - {e.response.text}")
+            except Exception as e:
+                logger.warning(f"Retry {attempt+1} for {symbol} due to {str(e)}")
                 await asyncio.sleep(2 ** attempt)
-            except httpx.RequestError as e:
-                logger.error(f"Network error for {symbol}: {str(e)}")
-                await asyncio.sleep(1)
-        logger.error(f"Failed to fetch klines for {symbol} after {retries} attempts")
+        logger.error(f"Failed to fetch klines for {symbol} after retries")
         return []
 
     async def get_fallback_price(symbol: str):
         url = f"{BINANCE_BASE_URL}/ticker/price"
         params = {"symbol": symbol}
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, params=params, timeout=10.0)
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(url, params=params)
                 response.raise_for_status()
-                data = response.json()
-                price = float(data["price"])
+                price = float(response.json()["price"])
                 return {
                     "time": selected_date.strftime('%Y-%m-%d %H:%M:%S'),
                     "symbol": symbol,
@@ -139,26 +131,19 @@ async def get_market_data(
                     "ma7-ma99": 0.0,
                     "ma25-ma99": 0.0
                 }
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch fallback price for {symbol}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Fallback fetch failed for {symbol}: {str(e)}")
             return None
 
     def calculate_metrics(symbol: str, klines: list):
         if not klines:
-            logger.warning(f"No data for {symbol}")
             return None
 
-        # Filter klines to selected day only
-        filtered_klines = [
-            k for k in klines
-            if selected_date.timestamp() * 1000 <= k[0] < end_date.timestamp() * 1000
-        ]
-
+        filtered_klines = [k for k in klines if selected_date.timestamp() * 1000 <= k[0] < end_date.timestamp() * 1000]
         if not filtered_klines:
-            logger.warning(f"No data for {symbol} within the selected day")
             return None
 
-        closes = [float(k[4]) for k in klines]  # All closes for MAs
+        closes = [float(k[4]) for k in klines]
         interval_candles = []
 
         for i, k in enumerate(filtered_klines):
@@ -169,7 +154,6 @@ async def get_market_data(
             close_price = float(k[4])
             volume = float(k[5])
 
-            # Find index in full klines for MA calculations
             kline_index = next((j for j, kline in enumerate(klines) if kline[0] == k[0]), len(klines) - 1)
             ma7 = round(pd.Series(closes[max(0, kline_index - 6): kline_index + 1]).mean(), 4)
             ma25 = round(pd.Series(closes[max(0, kline_index - 24): kline_index + 1]).mean(), 4)
@@ -195,6 +179,7 @@ async def get_market_data(
 
         return interval_candles[:expected_candles]
 
+    market_data = []
     klines = await get_klines(symbol)
     if klines:
         data = calculate_metrics(symbol, klines)
