@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.v1 import market  # relative import works in container
+from app.api.v1 import market  # relative import works in container
 
 app = FastAPI(title="AI Trading Dashboard API", version="1.0.0")
 
