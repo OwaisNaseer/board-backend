@@ -3,7 +3,7 @@ sys.path.append("D:\\board\\boardBackend\\app")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.v1 import market
+from app.api.v1 import market
 
 app = FastAPI(title="AI Trading Dashboard API", version="1.0.0")
 
